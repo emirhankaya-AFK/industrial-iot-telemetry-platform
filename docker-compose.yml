@@ -4,7 +4,8 @@ services:
     container_name: iot-mosquitto-broker
     ports:
       - "1883:1883"
-    command: mosquitto -c /mosquitto-no-auth.conf
+    volumes:
+      - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf
     restart: unless-stopped
 
   redis:
@@ -27,7 +28,7 @@ services:
       - MQTT_PORT=1883
       - IOT_ENV=production
       - IOT_ENFORCE_AUTH=true
-      - IOT_AUTH_SECRET=industrial_edge_scada_secret_key_2026
+      - IOT_AUTH_SECRET=${IOT_AUTH_SECRET:?set_in_environment}
     depends_on:
       - mqtt
       - redis
@@ -45,7 +46,7 @@ services:
       - API_URL=http://api:8000
       - IOT_ENV=production
       - IOT_ENFORCE_AUTH=true
-      - IOT_AUTH_SECRET=industrial_edge_scada_secret_key_2026
+      - IOT_AUTH_SECRET=${IOT_AUTH_SECRET:?set_in_environment}
     depends_on:
       - api
     restart: unless-stopped

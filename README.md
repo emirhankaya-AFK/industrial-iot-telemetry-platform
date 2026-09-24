@@ -248,11 +248,18 @@ The Streamlit-based operations terminal (`dashboard/app.py`) provides:
 
 ## Docker Deployment
 
-To spin up the entire stack (Redis broker, FastAPI backend, and Streamlit dashboard) with Docker Compose:
+To spin up the entire distributed stack (Mosquitto MQTT broker, Redis Streams, FastAPI backend, and Streamlit SCADA dashboard) with Docker Compose:
 
-```bash
-docker-compose up --build -d
-```
+1. **Configure Environment Secrets:**
+   ```bash
+   cp .env.example .env
+   # Edit .env and supply a secure IOT_AUTH_SECRET key
+   ```
+
+2. **Launch Stack:**
+   ```bash
+   docker compose up --build -d
+   ```
 
 - **API Documentation (Swagger UI)**: `http://localhost:8000/docs`
 - **SCADA Operations Dashboard**: `http://localhost:8501`

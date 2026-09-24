@@ -42,7 +42,7 @@ jobs:
 
       - name: Start Mosquitto MQTT Broker Service
         run: |
-          docker run -d --name mosquitto-ci -p 1883:1883 -v ${{ github.workspace }}/.github/mosquitto.conf:/mosquitto/config/mosquitto.conf eclipse-mosquitto:2.0
+          docker run -d --name mosquitto-ci -p 1883:1883 -v ${{ github.workspace }}/config/mosquitto.conf:/mosquitto/config/mosquitto.conf eclipse-mosquitto:2.0
           sleep 2
 
       - name: Run Pytest Test Suite (Live Redis & MQTT)
@@ -50,6 +50,7 @@ jobs:
           REDIS_URL: redis://localhost:6379/0
           MQTT_HOST: localhost
           MQTT_PORT: 1883
+          IOT_AUTH_SECRET: ${{ secrets.IOT_AUTH_SECRET || 'ci-ephemeral-scada-secret-key-998877' }}
         run: |
           pytest tests/ -v
 
@@ -58,6 +59,7 @@ jobs:
           REDIS_URL: redis://localhost:6379/0
           MQTT_HOST: localhost
           MQTT_PORT: 1883
+          IOT_AUTH_SECRET: ${{ secrets.IOT_AUTH_SECRET || 'ci-ephemeral-scada-secret-key-998877' }}
         run: |
           python tests/evaluation/run_benchmark.py
 
@@ -87,3 +89,67 @@ jobs:
           file: ./Dockerfile.dashboard
           push: false
           tags: industrial-iot-dashboard:latest
+
+  docker-compose-smoke-test:
+    name: Docker Compose Full Stack Smoke Test
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure Production Environment (.env)
+        run: |
+          echo "IOT_AUTH_SECRET=${{ secrets.IOT_AUTH_SECRET || 'ci-ephemeral-production-scada-secret-2026' }}" > .env
+          echo "IOT_ENV=production" >> .env
+          echo "IOT_ENFORCE_AUTH=true" >> .env
+          echo "REDIS_URL=redis://redis:6379/0" >> .env
+          echo "MQTT_HOST=mqtt" >> .env
+          echo "MQTT_PORT=1883" >> .env
+
+      - name: Build and Start Compose Services
+        run: |
+          docker compose build
+          docker compose up -d
+
+      - name: Wait for API and Redis/MQTT Connectivity Probe
+        run: |
+          echo "Waiting for services to become healthy..."
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s http://localhost:8000/health || true)
+            if echo "$STATUS" | grep -q '"status":"HEALTHY"'; then
+              echo "API is online and reported HEALTHY on attempt $i!"
+              break
+            fi
+            echo "Attempt $i: waiting for API..."
+            sleep 2
+          done
+
+          HEALTH_RESP=$(curl -s http://localhost:8000/health)
+          echo "API Health Probe Response:"
+          echo "$HEALTH_RESP"
+
+          # Assert API status, Redis stream connection, and MQTT broker connection
+          echo "$HEALTH_RESP" | grep -q '"status":"HEALTHY"' || (echo "API not healthy" && exit 1)
+          echo "$HEALTH_RESP" | grep -q '"redis_connected":true' || (echo "Redis stream not connected" && exit 1)
+          echo "$HEALTH_RESP" | grep -q '"mqtt_connected":true' || (echo "MQTT broker not connected" && exit 1)
+
+          echo "Checking SCADA Dashboard HTTP Response..."
+          DASH_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8501)
+          echo "Dashboard HTTP code: $DASH_CODE"
+          if [ "$DASH_CODE" != "200" ] && [ "$DASH_CODE" != "302" ] && [ "$DASH_CODE" != "304" ]; then
+            echo "Dashboard unexpected HTTP code: $DASH_CODE"
+            exit 1
+          fi
+          echo "All Docker Compose services verified healthy!"
+
+      - name: Output Logs on Failure
+        if: failure()
+        run: |
+          docker compose logs
+
+      - name: Teardown Services
+        if: always()
+        run: |
+          docker compose down -v
