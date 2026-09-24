@@ -16,6 +16,7 @@ from src.models.schemas import TelemetryRecord
 from src.pipeline.stream_processor import StreamProcessor
 from src.simulator.industrial_generator import IndustrialTelemetrySimulator
 from src.streaming.memory_stream import MemoryStreamEngine
+from src.streaming.redis_stream import RedisStreamEngine
 
 
 def benchmark_anomaly_classification():
@@ -160,11 +161,15 @@ def benchmark_streaming_engine_and_backpressure():
     print("  SECTION 2: DISTRIBUTED STREAMING ENGINE, BACKPRESSURE & RECOVERY")
     print("=" * 80)
 
-    # Part A: Consumer Group Queue Throughput & ACK Pipeline
     processor = StreamProcessor()
     sim = IndustrialTelemetrySimulator(seed=999)
     n_stream_events = 1000
 
+    is_live_redis = processor.stream.is_connected_to_redis
+    engine_name = "Live Redis Streams Server" if is_live_redis else "Deterministic In-Memory Engine (Fallback)"
+    print(f"  • Active Stream Engine          : {engine_name} ({processor.stream.redis_url if is_live_redis else 'MemoryStreamEngine'})")
+
+    # Part A: Consumer Group Queue Throughput & ACK Pipeline
     t_ingest_start = time.perf_counter()
     for i in range(n_stream_events):
         rec = sim.generate_reading("motor_unit_01")
@@ -185,10 +190,10 @@ def benchmark_streaming_engine_and_backpressure():
     t_consume = time.perf_counter() - t_consume_start
     consumer_throughput = n_stream_events / t_consume if t_consume > 0 else 0.0
 
-    print(f"  ✓ Stream Buffer Ingestion Rate  : {ingest_throughput:,.1f} events/sec")
-    print(f"  ✓ Consumer Group Processing Rate: {consumer_throughput:,.1f} events/sec (with XREADGROUP + XACK)")
+    print(f"  ✓ Stream Ingestion Throughput   : {ingest_throughput:,.1f} events/sec")
+    print(f"  ✓ Consumer Group Processing Rate: {consumer_throughput:,.1f} events/sec (XREADGROUP + XACK)")
 
-    # Part B: Empirical Backpressure Capacity Drop Verification
+    # Part B: Empirical Backpressure Capacity Drop Verification (Bounded Memory Buffer)
     bounded_engine = MemoryStreamEngine(max_len=200, drop_policy="drop_oldest")
     flood_count = 600
     for _ in range(flood_count):
@@ -200,33 +205,55 @@ def benchmark_streaming_engine_and_backpressure():
     actual_drops = bp_metrics.dropped_count
     drop_rate_pct = (actual_drops / flood_count) * 100.0
 
-    print(f"  ✓ Bounded Queue Stress Test     : {flood_count} events pumped into capacity 200 buffer")
+    print("  --- Backpressure Drop Stress Test (Bounded Buffer Capacity: 200) ---")
+    print(f"  ✓ Ingested Flood Events         : {flood_count} events without consumer drain")
     print(f"  ✓ Measured Dropped Events       : {actual_drops} (Expected: {expected_drops}, Rate: {drop_rate_pct:.1f}%)")
     print(f"  ✓ Active Buffer Backlog Depth   : {bp_metrics.backlog_count} / {bp_metrics.max_len}")
     assert actual_drops == expected_drops, f"Expected {expected_drops} drops, got {actual_drops}"
 
     # Part C: Worker Crash & PEL Recovery (XCLAIM)
-    crashed_group = "critical-alerts"
-    bounded_engine.create_consumer_group(crashed_group)
-    for _ in range(50):
-        bounded_engine.add(sim.generate_reading("cnc_crash_test"))
+    print("  --- Worker Crash & Stale Message Reclaim (PEL / XCLAIM) ---")
+    if is_live_redis:
+        live_engine = RedisStreamEngine(
+            redis_url=processor.stream.redis_url,
+            stream_name="benchmark:live:crash:test",
+            use_fallback_if_unavailable=False,
+        )
+        crashed_group = "redis-live-recovery-grp"
+        live_engine.create_consumer_group(crashed_group)
+        for _ in range(50):
+            live_engine.add(sim.generate_reading("cnc_crash_test"))
 
-    # Worker 1 reads 50 entries and simulatedly crashes without ACK
-    unacked_entries = bounded_engine.read_group(crashed_group, "crashed_worker_01", count=50)
-    pending_before = bounded_engine.get_pending_count(crashed_group)
-    print(f"  ✓ Worker Crash Simulation      : 'crashed_worker_01' pulled {len(unacked_entries)} records and died without ACK")
-    print(f"  ✓ Pending Entries List (PEL)    : {pending_before} unacknowledged entries held in PEL")
+        unacked = live_engine.read_group(crashed_group, "crashed_worker_01", count=50)
+        pending_before = live_engine.get_pending_count(crashed_group)
+        print(f"  ✓ Live Redis Worker Crash Sim   : 'crashed_worker_01' pulled {len(unacked)} records without ACK")
+        print(f"  ✓ Live Redis PEL Tracking       : {pending_before} unacknowledged entries held in Redis PEL")
 
-    # Worker 2 reclaims all stale entries with min_idle_ms=0
-    reclaimed = bounded_engine.claim_stale(crashed_group, "standby_worker_02", min_idle_ms=0, count=50)
-    print(f"  ✓ PEL Stale Message Reclaim     : 'standby_worker_02' reclaimed {len(reclaimed)}/50 entries via XCLAIM")
+        reclaimed = live_engine.claim_stale(crashed_group, "standby_worker_02", min_idle_ms=0, count=50)
+        print(f"  ✓ Live Redis XCLAIM Reclaim     : 'standby_worker_02' reclaimed {len(reclaimed)}/50 entries via XCLAIM")
+        for mid, _ in reclaimed:
+            live_engine.ack(crashed_group, mid)
 
-    # Worker 2 acknowledges all reclaimed entries
-    for msg_id, _ in reclaimed:
-        bounded_engine.ack(crashed_group, msg_id)
+        pending_after = live_engine.get_pending_count(crashed_group)
+        print(f"  ✓ Post-Recovery Live Redis PEL  : {pending_after} (100% XCLAIM Recovery on Live Redis Server)")
+    else:
+        crashed_group = "critical-alerts"
+        bounded_engine.create_consumer_group(crashed_group)
+        for _ in range(50):
+            bounded_engine.add(sim.generate_reading("cnc_crash_test"))
 
-    pending_after = bounded_engine.get_pending_count(crashed_group)
-    print(f"  ✓ Post-Recovery PEL Depth       : {pending_after} (100% Recovery & Acknowledgment Success)")
+        unacked_entries = bounded_engine.read_group(crashed_group, "crashed_worker_01", count=50)
+        pending_before = bounded_engine.get_pending_count(crashed_group)
+        print(f"  ✓ In-Memory Crash Simulation    : 'crashed_worker_01' pulled {len(unacked_entries)} records without ACK")
+        print(f"  ✓ Pending Entries List (PEL)    : {pending_before} unacknowledged entries held in PEL")
+
+        reclaimed = bounded_engine.claim_stale(crashed_group, "standby_worker_02", min_idle_ms=0, count=50)
+        print(f"  ✓ PEL Stale Message Reclaim     : 'standby_worker_02' reclaimed {len(reclaimed)}/50 entries (XCLAIM semantics)")
+        for msg_id, _ in reclaimed:
+            bounded_engine.ack(crashed_group, msg_id)
+
+        pending_after = bounded_engine.get_pending_count(crashed_group)
+        print(f"  ✓ Post-Recovery PEL Depth       : {pending_after} (100% Recovery & Acknowledgment Success)")
     assert pending_after == 0, "PEL was not completely cleared!"
 
     print("=" * 80 + "\n")

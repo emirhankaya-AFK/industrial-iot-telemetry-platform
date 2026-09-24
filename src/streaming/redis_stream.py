@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import redis
@@ -18,12 +19,12 @@ class RedisStreamEngine:
 
     def __init__(
         self,
-        redis_url: str = "redis://localhost:6379/0",
+        redis_url: Optional[str] = None,
         stream_name: str = "telemetry:stream",
         max_len: int = 50_000,
         use_fallback_if_unavailable: bool = True,
     ):
-        self.redis_url = redis_url
+        self.redis_url = redis_url or os.environ.get("REDIS_URL", "redis://localhost:6379/0")
         self.stream_name = stream_name
         self.max_len = max_len
         self.use_fallback = use_fallback_if_unavailable

@@ -10,6 +10,17 @@ jobs:
   lint-and-test:
     runs-on: ubuntu-latest
 
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -29,11 +40,24 @@ jobs:
         run: |
           ruff check .
 
-      - name: Run Pytest Test Suite
+      - name: Start Mosquitto MQTT Broker Service
+        run: |
+          docker run -d --name mosquitto-ci -p 1883:1883 -v ${{ github.workspace }}/.github/mosquitto.conf:/mosquitto/config/mosquitto.conf eclipse-mosquitto:2.0
+          sleep 2
+
+      - name: Run Pytest Test Suite (Live Redis & MQTT)
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          MQTT_HOST: localhost
+          MQTT_PORT: 1883
         run: |
           pytest tests/ -v
 
-      - name: Run Streaming Anomaly Benchmark
+      - name: Run Streaming Anomaly Benchmark (Live Redis Streams)
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          MQTT_HOST: localhost
+          MQTT_PORT: 1883
         run: |
           python tests/evaluation/run_benchmark.py
 

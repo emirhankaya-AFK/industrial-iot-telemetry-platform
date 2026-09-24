@@ -25,6 +25,9 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - MQTT_HOST=mqtt
       - MQTT_PORT=1883
+      - IOT_ENV=production
+      - IOT_ENFORCE_AUTH=true
+      - IOT_AUTH_SECRET=industrial_edge_scada_secret_key_2026
     depends_on:
       - mqtt
       - redis
@@ -39,6 +42,10 @@ services:
       - "8501:8501"
     environment:
       - REDIS_URL=redis://redis:6379/0
+      - API_URL=http://api:8000
+      - IOT_ENV=production
+      - IOT_ENFORCE_AUTH=true
+      - IOT_AUTH_SECRET=industrial_edge_scada_secret_key_2026
     depends_on:
       - api
     restart: unless-stopped

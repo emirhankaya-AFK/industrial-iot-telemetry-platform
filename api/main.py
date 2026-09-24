@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -38,10 +39,12 @@ async def lifespan(app: FastAPI):
     # Start background stream consumer
     _bg_consumer_task = asyncio.create_task(_background_stream_worker())
 
-    # Try starting MQTT subscriber (runs gracefully in background if Mosquitto available)
+    # Start MQTT subscriber using configured host and port from environment
+    mqtt_host = os.environ.get("MQTT_HOST", "localhost")
+    mqtt_port = int(os.environ.get("MQTT_PORT", 1883))
     _mqtt_subscriber = MQTTTelemetrySubscriber(
-        broker_host="localhost",
-        broker_port=1883,
+        broker_host=mqtt_host,
+        broker_port=mqtt_port,
         on_record_received=stream_processor.ingest_record,
     )
     _mqtt_subscriber.start()
