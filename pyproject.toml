@@ -1,0 +1,22 @@
+[project]
+name = "industrial-iot-telemetry-platform"
+version = "1.0.0"
+description = "Industrial Edge Telemetry Gateway & Streaming Anomaly Detection Platform"
+authors = [{ name = "Emirhan Kaya" }]
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E402", "E501", "F401", "RUF100"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package industrial.iot;
+
+enum SensorType {
+  SENSOR_TYPE_UNSPECIFIED = 0;
+  SENSOR_TYPE_MOTOR = 1;
+  SENSOR_TYPE_CNC_SPINDLE = 2;
+  SENSOR_TYPE_PUMP = 3;
+  SENSOR_TYPE_TRANSFORMER = 4;
+}
+
+message TelemetryRecord {
+  string device_id = 1;
+  int64 timestamp_ms = 2;
+  SensorType sensor_type = 3;
+  double temperature = 4;
+  double vibration_rms = 5;
+  double vibration_kurtosis = 6;
+  double current = 7;
+  double voltage = 8;
+  double power_factor = 9;
+  double frequency = 10;
+  string auth_token = 11;
+  map<string, string> metadata = 12;
+}
+
+message BatchTelemetryPayload {
+  string batch_id = 1;
+  int64 sent_at_ms = 2;
+  repeated TelemetryRecord records = 3;
+}

@@ -1,0 +1,44 @@
+services:
+  mqtt:
+    image: eclipse-mosquitto:2.0
+    container_name: iot-mosquitto-broker
+    ports:
+      - "1883:1883"
+    command: mosquitto -c /mosquitto-no-auth.conf
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: iot-redis-streams
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: iot-telemetry-api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MQTT_HOST=mqtt
+      - MQTT_PORT=1883
+    depends_on:
+      - mqtt
+      - redis
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: iot-scada-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - api
+    restart: unless-stopped
