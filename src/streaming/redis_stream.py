@@ -127,6 +127,12 @@ class RedisStreamEngine:
     def get_pending_count(self, group_name: str) -> int:
         if not self._is_live_redis or self._redis is None:
             return self._memory_engine.get_pending_count(group_name)
+        try:
+            summary = self._redis.xpending(self.stream_name, group_name)
+            if isinstance(summary, dict) and "pending" in summary:
+                return int(summary["pending"])
+        except Exception:
+            pass
         return len(self.get_pending_entries(group_name))
 
     def get_pending_entries(self, group_name: str) -> List[dict]:
@@ -135,15 +141,21 @@ class RedisStreamEngine:
 
         try:
             pel = self._redis.xpending_range(self.stream_name, group_name, min="-", max="+", count=50)
-            return [
-                {
-                    "msg_id": item["message_id"],
-                    "consumer": item["consumer"],
-                    "idle_time_ms": item["idle_time"],
-                }
-                for item in pel
-            ]
-        except Exception:
+            results = []
+            for item in pel:
+                msg_id = item.get("name") or item.get("message_id")
+                consumer = item.get("consumer")
+                idle = item.get("idle_time") or item.get("idle_time_ms") or 0
+                results.append(
+                    {
+                        "msg_id": str(msg_id),
+                        "consumer": str(consumer),
+                        "idle_time_ms": int(idle),
+                    }
+                )
+            return results
+        except Exception as e:
+            logger.warning("Redis xpending_range error: %s", e)
             return []
 
     def claim_stale(
@@ -179,9 +191,17 @@ class RedisStreamEngine:
                 message_ids=stale_ids,
             )
             reclaimed: List[Tuple[str, TelemetryRecord]] = []
-            for msg_id, fields in claimed:
-                rec = TelemetryRecord.model_validate_json(fields["payload"])
-                reclaimed.append((str(msg_id), rec))
+            for item in claimed:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    msg_id, fields = item
+                elif isinstance(item, dict):
+                    msg_id = item.get("name") or item.get("message_id")
+                    fields = item
+                else:
+                    continue
+                if isinstance(fields, dict) and "payload" in fields:
+                    rec = TelemetryRecord.model_validate_json(fields["payload"])
+                    reclaimed.append((str(msg_id), rec))
             return reclaimed
         except Exception as e:
             logger.error("Redis XCLAIM error: %s", e)
