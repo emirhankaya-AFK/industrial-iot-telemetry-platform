@@ -9,9 +9,9 @@
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An industrial-grade edge telemetry ingestion and real-time streaming anomaly detection platform designed for critical cyber-physical systems (AC induction motors, high-speed CNC spindles, and centrifugal pumps).
+An industrial-grade edge telemetry ingestion and real-time streaming anomaly detection platform designed for mission-critical cyber-physical systems (AC induction motors, high-speed CNC spindles, and centrifugal pumps).
 
-The platform ingests high-frequency sensor streams (3-phase current, triaxial vibration, bearing temperature, RPM, acoustic noise) over **MQTT** and **HTTP**, validates payloads via **Protocol Buffers (Proto3)** and **JSON**, enforces **HMAC-SHA256 device authentication** and clock-drift rejection, processes streams using **Redis Streams** consumer groups with backpressure drop handling and crash recovery, detects anomalous behavior using a multi-detector streaming ensemble (**EWMA**, **Robust Median/MAD Z-Score**, **Cross-Sensor Correlation Fusion**, and **Isolation Forest** baseline), debounces alerts, and dispatches incident webhooks with exponential backoff and Dead-Letter Queue (DLQ) containment.
+The platform ingests high-frequency sensor streams (3-phase current, triaxial vibration, bearing temperature, RPM, acoustic noise) over **MQTT** and **HTTP**, validates payloads via **Protocol Buffers (Proto3)** and **JSON**, enforces **production HMAC-SHA256 authentication** with clock-drift rejection and unknown device quarantining, buffers and processes streams using **Redis Streams** consumer groups with backpressure drop handling and crash recovery, detects anomalous behavior using a real-time streaming ensemble (**EWMA**, **Robust Median/MAD Z-Score**, and **Cross-Sensor Correlation Fusion**, benchmarked against an **Isolation Forest** offline comparative baseline), debounces alerts, and dispatches incident webhooks with exponential backoff and Dead-Letter Queue (DLQ) containment.
 
 ---
 
@@ -28,15 +28,15 @@ flowchart TD
     subgraph Ingestion ["Ingestion & Security Gateway"]
         MQTT["MQTT Broker\n(Mosquitto / Paho)"]
         HTTP["FastAPI Gateway\n(/api/v1/telemetry)"]
-        AUTH["Authenticator & Guard\n- HMAC-SHA256 Token Auth\n- Clock-Drift Window (<300s)\n- Proto3 Wire & JSON Schema"]
+        AUTH["Authenticator & Guard\n- Production HMAC-SHA256 Token Auth\n- Strict Env-Var Secrets (IOT_AUTH_SECRET)\n- Unknown Device Rejection\n- Clock-Drift Window (<300s)\n- Proto3 Wire & JSON Schema"]
     end
 
     subgraph Streaming ["Distributed Stream Buffer"]
-        RS["Redis Streams (Stream: industrial:telemetry)\n- Consumer Groups (XREADGROUP)\n- Backpressure Capacity Drop Policy\n- In-Memory Fallback Engine (Dual-Mode)"]
+        RS["Redis Streams (Stream: industrial:telemetry)\n- Consumer Groups (XREADGROUP)\n- Measured Backpressure Capacity Drop Policy\n- In-Memory Fallback Engine (Dual-Mode)"]
         PEL["Pending Entries List (PEL)\n- XACK Acknowledgment\n- Stale Message Reclaim (XCLAIM)"]
     end
 
-    subgraph Detectors ["Real-Time Streaming Anomaly Ensemble"]
+    subgraph Detectors ["Streaming Anomaly Ensemble & ML Baseline"]
         EWMA["Streaming EWMA\nPre-update Mean/Variance z-score"]
         MAD["Robust Rolling Z-Score\nMedian & MAD (Median Absolute Dev)"]
         CORR["Multi-Sensor Correlation Fusion\nVibration + Temp + Current Seizure Index"]
@@ -61,8 +61,9 @@ flowchart TD
     HTTP --> AUTH
     AUTH --> RS
     RS <--> PEL
-    RS --> EWMA & MAD & CORR & IF
-    EWMA & MAD & CORR & IF --> DEDUP
+    RS --> EWMA & MAD & CORR
+    EWMA & MAD & CORR --> DEDUP
+    IF -.->|Offline Comparative Baseline| EWMA
     DEDUP --> DISPATCH
     DISPATCH -->|Exhausted Retries| DLQ
     DISPATCH -->|HTTP Webhook| DASH
@@ -72,16 +73,26 @@ flowchart TD
 
 ---
 
-## Industrial Machinery Failure Modes
+## Security & Device Authentication
 
-The platform models and detects four critical cyber-physical failure modes:
+The gateway implements zero-trust edge authentication designed for industrial deployments:
+- **HMAC-SHA256 Payload Signing**: Every edge telemetry packet is signed using `HMAC-SHA256(secret, "{device_id}:{timestamp_ms}")`.
+- **Environment-Isolated Secrets**: Hardcoded secrets are strictly prohibited. Keys are loaded dynamically via `IOT_AUTH_SECRET` or per-device mappings in `IOT_DEVICE_SECRETS`.
+- **Production Enforcement Mode**: When `IOT_ENFORCE_AUTH=true` or `IOT_ENV=production`, unregistered edge devices transmitting telemetry are rejected immediately (`HTTP 400 - Unregistered device`), preventing rogue sensors from injecting spoofed metrics into the stream buffer.
+- **Strict Clock-Drift Window**: Ingestion timestamps are validated against gateway epoch time ($<300\text{ s}$ window) to prevent replay attacks and clock skew anomalies.
 
-| Failure Mode | Target Equipment | Physical Signature | Primary Detector |
+---
+
+## Machinery Failure Modes & Multi-Class Classification
+
+The platform models and classifies four critical cyber-physical failure modes:
+
+| Failure Mode | Target Equipment | Physical Signature | Classification Rule |
 | :--- | :--- | :--- | :--- |
-| **Bearing Fatigue (Spalling/Pitting)** | CNC Spindles, Pumps | Progressive rise in vibration RMS ($>8.5\text{ mm/s}$), kurtosis spikes ($>4.5$), high-frequency acoustic emissions. | Rolling Robust Z-Score (Median/MAD) |
-| **3-Phase Current Imbalance** | AC Induction Motors | Phase current divergence ($>15\%$ imbalance ratio), negative-sequence currents, excessive thermal dissipation. | Streaming EWMA & Threshold Guard |
-| **Thermal Runaway** | Induction Motors, Pumps | Exponential temperature climb ($>85^\circ\text{C}$), failure of convective cooling, steady baseline acceleration. | Streaming EWMA (Trend Evaluation) |
-| **Correlated Mechanical Seizure** | Slurry Pumps, Motors | Simultaneous mechanical binding: current surges to locked-rotor levels ($>40\text{ A}$) with an immediate vibration spike and thermal gradient. | Multi-Sensor Cross-Correlation Fusion |
+| **Bearing Fatigue (Spalling/Pitting)** | CNC Spindles, Pumps | Progressive vibration RMS rise ($>8.5\text{ mm/s}$), kurtosis peaks ($>4.5$), with nominal current draw. | Rolling Robust Z-Score (Vibration & Kurtosis) |
+| **3-Phase Current Imbalance** | AC Induction Motors | Phase current divergence ($>15\%$ imbalance ratio), negative-sequence currents, voltage sag, without vibration shock. | Streaming EWMA (Current Surge) |
+| **Thermal Runaway** | Induction Motors, Pumps | Exponential temperature climb ($>85^\circ\text{C}$), failure of convective cooling, steady baseline acceleration. | Streaming EWMA (Thermal Drift) |
+| **Correlated Mechanical Seizure** | Slurry Pumps, Motors | Simultaneous mechanical binding: current surges to locked-rotor levels ($>40\text{ A}$) with an immediate vibration shock ($>5.5\text{ g}$). | Multi-Sensor Cross-Correlation Fusion |
 
 ---
 
@@ -110,45 +121,65 @@ $$\text{Robust } Z = \frac{0.6745 \cdot (x_t - \text{Median}_W)}{\text{MAD}_W + 
 The scale factor $0.6745$ equates the MAD to standard deviation for normal distributions, yielding robust outlier isolation even during sustained step shifts.
 
 ### 3. Multi-Sensor Cross-Correlation Deviation Index
-Physical failures rarely manifest in a single dimension. For coupled phenomena (e.g. rotor seizure causing both current surges and vibration shocks):
+Physical failures rarely manifest in a single dimension. For coupled electromechanical phenomena (e.g. rotor seizure causing concurrent current surges and vibration shocks):
 
 $$D_{\text{seizure}} = \sqrt{w_v \cdot Z_{\text{vib}}^2 + w_i \cdot Z_{\text{curr}}^2 + w_t \cdot \max(0, Z_{\text{temp}})}$$
 
 When $D_{\text{seizure}} \ge \tau_{\text{corr}}$, an immediate `CRITICAL` alert is generated, bypassing routine cooldown timers.
 
+### 4. Multivariate Isolation Forest (Comparative ML Baseline)
+Used as an offline comparative reference model. In batch calibration mode, normal operational vectors $\mathbf{x} = [T, v_{\text{rms}}, v_{\text{kurt}}, I, \cos\phi]$ construct an ensemble of 100 isolation trees to benchmark online heuristic accuracy against high-dimensional path-length separation.
+
 ---
 
 ## Quantitative Benchmark Results
 
-The evaluation benchmark (`tests/evaluation/run_benchmark.py`) subjects the streaming pipeline to **1,200 continuous industrial events**, alternating nominal operations with 4 synthetic failure modes.
+The evaluation benchmark (`tests/evaluation/run_benchmark.py`) evaluates the complete system across **1,200 continuous industrial events** (1,000 nominal baseline events and 200 controlled fault events across 4 operational shifts).
 
-### Classification & Anomaly Detection Performance
+### Section 1: Multi-Class Confusion Matrix & Classification
+
+All metrics are derived directly from the ground-truth vs predicted confusion matrix (no synthetic false-positive splitting):
 
 ```
-================================================================================
-INDUSTRIAL STREAMING ANOMALY BENCHMARK REPORT
-================================================================================
-Total Synthesized Events: 1,200 (Nominal: 900, Injected Anomaly: 300)
-Overall Accuracy:         92.4% (1109 / 1200)
-Overall Precision:        0.73
-Overall Recall:           0.88
-Overall F1-Score:         0.79
+CONFUSION MATRIX (Ground Truth rows vs Predicted columns):
+Actual \ Predicted     |    NOMINAL | BEARING_FA | THERMAL_RU | PHASE_IMBA | CORRELATED
 --------------------------------------------------------------------------------
-Fault Mode Breakdown:
-  - Bearing Fatigue:      Precision: 0.74 | Recall: 0.90 | F1-Score: 0.81
-  - Phase Imbalance:      Precision: 0.74 | Recall: 0.92 | F1-Score: 0.82
-  - Correlated Seizure:   Precision: 0.74 | Recall: 0.90 | F1-Score: 0.81
-  - Thermal Runaway:      Precision: 0.71 | Recall: 0.78 | F1-Score: 0.74
+NOMINAL                |        890 |         33 |         61 |         16 |          0
+BEARING_FATIGUE        |          5 |         45 |          0 |          0 |          0
+THERMAL_RUNAWAY        |          4 |          4 |         38 |          1 |          3
+PHASE_IMBALANCE        |          5 |          0 |          0 |         45 |          0
+CORRELATED_SEIZURE     |          5 |          0 |          0 |          0 |         45
 --------------------------------------------------------------------------------
-Pipeline Performance Metrics:
-  - Ingestion Throughput: 4,625 events/sec
-  - Average Latency:      0.216 ms / event
-  - 95th Percentile Lat.: 0.518 ms / event
-  - Dropped Events:       0 (0.0% drop rate)
-================================================================================
 ```
 
-*Note: Precision reflects realistic industrial sensitivity where early transient warnings are caught before catastrophic component failure occurs.*
+| Failure Mode / Class | Precision | Recall | F1-Score | Support |
+| :--- | :--- | :--- | :--- | :--- |
+| **NOMINAL** | **0.98** | **0.89** | **0.93** | 1,000 |
+| **BEARING_FATIGUE** | 0.55 | 0.90 | 0.68 | 50 |
+| **THERMAL_RUNAWAY** | 0.38 | 0.76 | 0.51 | 50 |
+| **PHASE_IMBALANCE** | 0.73 | 0.90 | 0.80 | 50 |
+| **CORRELATED_SEIZURE** | **0.94** | **0.90** | **0.92** | 50 |
+| **ANOMALY FAULT MACRO** | **0.65** | **0.86** | **0.73** | 200 |
+
+- **Multi-Class Overall Accuracy**: **88.6%** (1063 / 1200)
+- **Detector Ensemble Throughput**: **3,600+ events/sec**
+- **Average Processing Latency**: **0.276 ms / event** (p95: 0.831 ms, p99: 2.069 ms)
+
+### Section 2: Distributed Streaming Engine & Backpressure Reliability
+
+Tested directly against the stream engine and consumer groups (`XREADGROUP`, `XACK`, `XCLAIM`):
+
+```
+  ✓ Stream Buffer Ingestion Rate  : 69,800+ events/sec
+  ✓ Consumer Group Processing Rate: 4,800+ events/sec (with XREADGROUP + XACK)
+  ✓ Bounded Queue Stress Test     : 600 events pumped into capacity 200 buffer
+  ✓ Measured Dropped Events       : 400 (Expected: 400, Measured Rate: 66.7%)
+  ✓ Active Buffer Backlog Depth   : 200 / 200
+  ✓ Worker Crash Simulation      : 'crashed_worker_01' pulled 50 records and died without ACK
+  ✓ Pending Entries List (PEL)    : 50 unacknowledged entries held in PEL
+  ✓ PEL Stale Message Reclaim     : 'standby_worker_02' reclaimed 50/50 entries via XCLAIM
+  ✓ Post-Recovery PEL Depth       : 0 (100% Recovery & Acknowledgment Success)
+```
 
 ---
 
@@ -193,10 +224,10 @@ The Streamlit-based operations terminal (`dashboard/app.py`) provides:
 
 4. **Run Code Quality Checks and Tests:**
    ```bash
-   # Linting with Ruff
+   # Linting with Ruff (0 errors)
    ruff check .
 
-   # Unit and integration test suite (31 tests)
+   # Unit and integration test suite (35 tests)
    pytest tests/ -v
 
    # Run quantitative benchmark
@@ -234,8 +265,7 @@ docker-compose up --build -d
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
 | `/health` | `GET` | System liveness probe and component status. |
-| `/api/v1/telemetry/ingest` | `POST` | Ingest single telemetry record (async stream queuing). |
-| `/api/v1/telemetry/ingest/sync` | `POST` | Ingest and evaluate immediately through detector pipeline. |
+| `/api/v1/telemetry` | `POST` | Ingest single telemetry record (async stream queuing or sync detect). |
 | `/api/v1/telemetry/batch` | `POST` | Ingest batch of telemetry records. |
 | `/api/v1/telemetry/live/{device_id}`| `GET` | Retrieve latest telemetry buffer for device. |
 | `/api/v1/devices` | `GET` | List all registered industrial devices and statuses. |

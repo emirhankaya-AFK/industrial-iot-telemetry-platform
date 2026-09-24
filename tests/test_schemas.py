@@ -92,9 +92,10 @@ class TestProtobufAndJsonBridge:
 
 class TestDeviceAuthenticator:
     def test_device_registration_and_auth(self):
-        auth = DeviceAuthenticator(enforce_auth=True)
+        auth = DeviceAuthenticator(default_secret="test_secret_123", enforce_auth=True)
         dev_id = "cnc_spindle_02"
         now_ms = int(time.time() * 1000)
+        auth.register_device(dev_id, secret_key="test_secret_123")
         token = auth.generate_token(dev_id, now_ms)
 
         rec = TelemetryRecord(
@@ -111,9 +112,40 @@ class TestDeviceAuthenticator:
         assert dev_status.is_online is True
         assert dev_status.total_events == 1
 
+    def test_unregistered_device_rejected_in_enforced_mode(self):
+        auth = DeviceAuthenticator(default_secret="test_secret_123", enforce_auth=True)
+        now_ms = int(time.time() * 1000)
+        rec = TelemetryRecord(
+            device_id="unknown_rogue_device",
+            timestamp_ms=now_ms,
+            temperature=40.0,
+            vibration_rms=1.0,
+            current=15.0,
+            auth_token="dummy_token",
+        )
+        with pytest.raises(ValueError, match="unregistered device"):
+            auth.authenticate(rec)
+
+    def test_missing_token_rejected_in_enforced_mode(self):
+        auth = DeviceAuthenticator(default_secret="test_secret_123", enforce_auth=True)
+        dev_id = "registered_dev"
+        auth.register_device(dev_id)
+        now_ms = int(time.time() * 1000)
+        rec = TelemetryRecord(
+            device_id=dev_id,
+            timestamp_ms=now_ms,
+            temperature=40.0,
+            vibration_rms=1.0,
+            current=15.0,
+            auth_token=None,
+        )
+        with pytest.raises(ValueError, match="missing auth_token"):
+            auth.authenticate(rec)
+
     def test_invalid_token_rejected(self):
-        auth = DeviceAuthenticator(enforce_auth=True)
+        auth = DeviceAuthenticator(default_secret="test_secret_123", enforce_auth=True)
         dev_id = "cnc_spindle_02"
+        auth.register_device(dev_id, secret_key="test_secret_123")
         now_ms = int(time.time() * 1000)
 
         rec = TelemetryRecord(
@@ -124,5 +156,12 @@ class TestDeviceAuthenticator:
             current=15.0,
             auth_token="tampered_fake_token",
         )
-        with pytest.raises(ValueError, match="Authentication failed"):
+        with pytest.raises(ValueError, match="Authentication failed: invalid token signature"):
             auth.authenticate(rec)
+
+    def test_env_var_secret_loading(self, monkeypatch):
+        monkeypatch.setenv("IOT_AUTH_SECRET", "env_secret_key_456")
+        monkeypatch.setenv("IOT_ENFORCE_AUTH", "true")
+        auth = DeviceAuthenticator()
+        assert auth.enforce_auth is True
+        assert auth.default_secret == "env_secret_key_456"

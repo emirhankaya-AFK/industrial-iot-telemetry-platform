@@ -123,6 +123,11 @@ class RedisStreamEngine:
             logger.error("Redis XACK error: %s", e)
             return False
 
+    def get_pending_count(self, group_name: str) -> int:
+        if not self._is_live_redis or self._redis is None:
+            return self._memory_engine.get_pending_count(group_name)
+        return len(self.get_pending_entries(group_name))
+
     def get_pending_entries(self, group_name: str) -> List[dict]:
         if not self._is_live_redis or self._redis is None:
             return self._memory_engine.get_pending_entries(group_name)
@@ -145,13 +150,23 @@ class RedisStreamEngine:
         group_name: str,
         new_consumer: str,
         min_idle_time_ms: int = 5000,
+        min_idle_ms: Optional[int] = None,
+        count: Optional[int] = None,
     ) -> List[Tuple[str, TelemetryRecord]]:
+        idle_threshold = min_idle_ms if min_idle_ms is not None else min_idle_time_ms
         if not self._is_live_redis or self._redis is None:
-            return self._memory_engine.claim_stale(group_name, new_consumer, min_idle_time_ms)
+            return self._memory_engine.claim_stale(
+                group_name,
+                new_consumer,
+                min_idle_time_ms=idle_threshold,
+                count=count,
+            )
 
         try:
             pel = self.get_pending_entries(group_name)
-            stale_ids = [item["msg_id"] for item in pel if item["idle_time_ms"] >= min_idle_time_ms]
+            stale_ids = [item["msg_id"] for item in pel if item["idle_time_ms"] >= idle_threshold]
+            if count is not None:
+                stale_ids = stale_ids[:count]
             if not stale_ids:
                 return []
 
@@ -159,7 +174,7 @@ class RedisStreamEngine:
                 self.stream_name,
                 group_name,
                 new_consumer,
-                min_idle_time=min_idle_time_ms,
+                min_idle_time=idle_threshold,
                 message_ids=stale_ids,
             )
             reclaimed: List[Tuple[str, TelemetryRecord]] = []

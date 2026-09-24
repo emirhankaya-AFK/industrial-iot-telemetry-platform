@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import os
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 from src.models.schemas import DeviceStatus, SensorType, TelemetryRecord
 
@@ -14,20 +16,48 @@ class DeviceAuthenticator:
 
     def __init__(
         self,
-        default_secret: str = "industrial_iot_super_secret_key_2026",
+        default_secret: Optional[str] = None,
         max_clock_drift_seconds: int = 300,
-        enforce_auth: bool = False,
+        enforce_auth: Optional[bool] = None,
     ):
-        self.default_secret = default_secret
-        self.max_clock_drift_seconds = max_clock_drift_seconds
-        self.enforce_auth = enforce_auth
+        # Resolve auth secret strictly from parameter or environment
+        self.default_secret: Optional[str] = default_secret or os.environ.get("IOT_AUTH_SECRET")
+        self.max_clock_drift_seconds: int = max_clock_drift_seconds
+
+        # Production mode or explicit env flag enforces auth by default
+        if enforce_auth is not None:
+            self.enforce_auth: bool = enforce_auth
+        else:
+            env_enforce = os.environ.get("IOT_ENFORCE_AUTH", "").strip().lower() in ("true", "1", "yes")
+            is_prod = os.environ.get("IOT_ENV", "").strip().lower() == "production"
+            self.enforce_auth = env_enforce or is_prod
+
         self._device_keys: Dict[str, str] = {}
         self._device_registry: Dict[str, DeviceStatus] = {}
 
-    def register_device(self, device_id: str, secret_key: str | None = None, sensor_type: SensorType = SensorType.MOTOR) -> None:
-        """Registers a known device with its HMAC secret key."""
+        # Load any preconfigured device secrets from environment JSON if present
+        env_dev_secrets = os.environ.get("IOT_DEVICE_SECRETS")
+        if env_dev_secrets:
+            try:
+                parsed_secrets = json.loads(env_dev_secrets)
+                if isinstance(parsed_secrets, dict):
+                    for dev_id, sec in parsed_secrets.items():
+                        self.register_device(str(dev_id), secret_key=str(sec))
+            except json.JSONDecodeError:
+                pass
+
+    def register_device(
+        self,
+        device_id: str,
+        secret_key: Optional[str] = None,
+        sensor_type: SensorType = SensorType.MOTOR,
+    ) -> None:
+        """Registers a known device with its specific HMAC secret key."""
         now_ms = int(time.time() * 1000)
-        self._device_keys[device_id] = secret_key or self.default_secret
+        resolved_secret = secret_key or self.default_secret
+        if resolved_secret:
+            self._device_keys[device_id] = resolved_secret
+
         if device_id not in self._device_registry:
             self._device_registry[device_id] = DeviceStatus(
                 device_id=device_id,
@@ -38,9 +68,14 @@ class DeviceAuthenticator:
                 is_online=True,
             )
 
-    def generate_token(self, device_id: str, timestamp_ms: int) -> str:
+    def generate_token(self, device_id: str, timestamp_ms: int, secret_key: Optional[str] = None) -> str:
         """Generates valid HMAC-SHA256 token for a device and timestamp."""
-        secret = self._device_keys.get(device_id, self.default_secret)
+        secret = secret_key or self._device_keys.get(device_id) or self.default_secret
+        if not secret:
+            raise ValueError(
+                f"Cannot generate auth token: no HMAC secret configured for device '{device_id}' "
+                "(set IOT_AUTH_SECRET or register with secret_key)"
+            )
         msg = f"{device_id}:{timestamp_ms}".encode("utf-8")
         return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:16]
 
@@ -56,9 +91,22 @@ class DeviceAuthenticator:
             )
 
         if self.enforce_auth:
+            # When authentication is enforced, unknown devices are rejected immediately
+            is_known = (record.device_id in self._device_keys) or (record.device_id in self._device_registry)
+            if not is_known:
+                raise ValueError(
+                    f"Authentication failed: unregistered device '{record.device_id}'. "
+                    "Device must be pre-registered before transmitting telemetry in authenticated mode."
+                )
+
             if not record.auth_token:
                 raise ValueError(f"Authentication failed: missing auth_token for device '{record.device_id}'")
-            expected_token = self.generate_token(record.device_id, record.timestamp_ms)
+
+            secret = self._device_keys.get(record.device_id) or self.default_secret
+            if not secret:
+                raise ValueError(f"Authentication failed: no HMAC secret key configured for device '{record.device_id}'")
+
+            expected_token = self.generate_token(record.device_id, record.timestamp_ms, secret_key=secret)
             if not hmac.compare_digest(record.auth_token, expected_token):
                 raise ValueError(f"Authentication failed: invalid token signature for device '{record.device_id}'")
 

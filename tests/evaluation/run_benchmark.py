@@ -1,11 +1,13 @@
 """Empirical Quantitative Benchmark Runner for Industrial Edge Telemetry Platform.
-Evaluates Precision, Recall, F1, Alert Latency (ms), Throughput (events/sec), and Backpressure Drops.
+Evaluates Multi-Class Anomaly Classification (with Confusion Matrix),
+Stream Ingestion Throughput, Consumer Groups, Real Backpressure Drops, and PEL Crash Recovery.
 """
 from __future__ import annotations
 
 import sys
 import time
 from pathlib import Path
+from typing import Dict, List
 
 ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
@@ -13,142 +15,234 @@ sys.path.insert(0, str(ROOT))
 from src.models.schemas import TelemetryRecord
 from src.pipeline.stream_processor import StreamProcessor
 from src.simulator.industrial_generator import IndustrialTelemetrySimulator
+from src.streaming.memory_stream import MemoryStreamEngine
 
 
-def run_benchmark():
+def benchmark_anomaly_classification():
     print("\n" + "=" * 80)
-    print("  INDUSTRIAL EDGE TELEMETRY & ANOMALY DETECTION — QUANTITATIVE BENCHMARK")
+    print("  SECTION 1: MULTI-CLASS ANOMALY CLASSIFICATION & CONFUSION MATRIX")
     print("=" * 80)
 
     sim = IndustrialTelemetrySimulator(seed=1337)
     processor = StreamProcessor()
 
     devices = ["motor_unit_01", "cnc_spindle_02", "cooling_pump_03"]
-    total_events = 1200
     nominal_count = 1000
     anomaly_count = 200
+    total_events = nominal_count + anomaly_count
 
-    # Ground truth tracking: [(record, is_anomalous, fault_type)]
-    test_stream: list[tuple[TelemetryRecord, bool, str]] = []
-    base_time = int(time.time() * 1000) - (total_events * 50)
-
-    # 1. Generate Warmup + Nominal baseline
-    for i in range(nominal_count):
-        dev = devices[i % len(devices)]
-        t_ms = base_time + i * 50
-        rec = sim.generate_reading(dev, timestamp_ms=t_ms)
-        test_stream.append((rec, False, "NOMINAL"))
-
-    # 2. Inject Controlled Anomaly Bursts
+    # Ground truth tracking: [(record, ground_truth_class)]
+    test_stream: List[tuple[TelemetryRecord, str]] = []
     fault_types = ["BEARING_FATIGUE", "THERMAL_RUNAWAY", "PHASE_IMBALANCE", "CORRELATED_SEIZURE"]
-    for i in range(anomaly_count):
-        dev = devices[i % len(devices)]
-        t_ms = base_time + (nominal_count + i) * 50
-        fault = fault_types[(i // 50) % len(fault_types)]
-        sim.inject_fault(dev, fault)
-        rec = sim.generate_reading(dev, timestamp_ms=t_ms)
-        test_stream.append((rec, True, fault))
+    base_time = int(time.time() * 1000) - (total_events * 50)
+    current_step = 0
 
-    # Reset faults
+    # 4 distinct operational shifts (250 nominal baseline + 50 fault burst per shift)
+    for fault in fault_types:
+        # Clear any past faults for nominal burn-in
+        for d in devices:
+            sim.clear_fault(d)
+
+        for _ in range(nominal_count // len(fault_types)):
+            dev = devices[current_step % len(devices)]
+            t_ms = base_time + current_step * 50
+            rec = sim.generate_reading(dev, timestamp_ms=t_ms)
+            test_stream.append((rec, "NOMINAL"))
+            current_step += 1
+
+        # Inject specific machinery fault mode
+        for d in devices:
+            sim.inject_fault(d, fault)
+
+        for _ in range(anomaly_count // len(fault_types)):
+            dev = devices[current_step % len(devices)]
+            t_ms = base_time + current_step * 50
+            rec = sim.generate_reading(dev, timestamp_ms=t_ms)
+            test_stream.append((rec, fault))
+            current_step += 1
+
+    # Clear active faults after generation
     for d in devices:
         sim.clear_fault(d)
 
-    # 3. Execute Streaming Pipeline & Measure Throughput
-    t_start = time.perf_counter()
-    detection_results = []
-    latencies = []
+    # 3. Synchronous inference & latency timing
+    classes = ["NOMINAL", "BEARING_FATIGUE", "THERMAL_RUNAWAY", "PHASE_IMBALANCE", "CORRELATED_SEIZURE"]
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    cm = [[0 for _ in classes] for _ in classes]
 
-    for rec, is_anom_gt, fault_type in test_stream:
+    latencies: List[float] = []
+    t_start = time.perf_counter()
+
+    for rec, gt_class in test_stream:
         t0 = time.perf_counter()
-        anoms = processor.process_record_sync(rec)
+        anomalies = processor.run_detectors(rec)
+        pred_class = processor.classify_fault(anomalies)
         lat = (time.perf_counter() - t0) * 1000.0
         latencies.append(lat)
-        detected = len(anoms) > 0
-        detection_results.append({
-            "is_anom_gt": is_anom_gt,
-            "detected": detected,
-            "fault_type": fault_type,
-            "latency_ms": lat,
-        })
+
+        gt_idx = class_to_idx[gt_class]
+        pred_idx = class_to_idx.get(pred_class, 0)
+        cm[gt_idx][pred_idx] += 1
 
     t_total = time.perf_counter() - t_start
     throughput = len(test_stream) / t_total if t_total > 0 else 0.0
 
-    # 4. Compute Metrics per Fault Type
-    fault_breakdown: dict[str, dict] = {
-        f: {"tp": 0, "fp": 0, "fn": 0}
-        for f in fault_types
-    }
-    overall_tp = 0
-    overall_fp = 0
-    overall_fn = 0
-    overall_tn = 0
+    # 4. Print Multi-Class Confusion Matrix
+    header_title = r"Actual \ Predicted"
+    print("\nCONFUSION MATRIX (Ground Truth rows vs Predicted columns):")
+    print(f"{header_title:<22} | " + " | ".join(f"{c[:10]:>10}" for c in classes))
+    print("-" * 80)
+    for i, c_actual in enumerate(classes):
+        row_str = " | ".join(f"{cm[i][j]:>10}" for j in range(len(classes)))
+        print(f"{c_actual:<22} | {row_str}")
+    print("-" * 80)
 
-    for res in detection_results:
-        gt = res["is_anom_gt"]
-        pred = res["detected"]
-        f_type = res["fault_type"]
+    # 5. Compute Per-Class Precision, Recall, F1
+    total_correct = sum(cm[i][i] for i in range(len(classes)))
+    overall_accuracy = total_correct / len(test_stream)
 
-        if gt and pred:
-            overall_tp += 1
-            if f_type in fault_breakdown:
-                fault_breakdown[f_type]["tp"] += 1
-        elif not gt and pred:
-            overall_fp += 1
-        elif gt and not pred:
-            overall_fn += 1
-            if f_type in fault_breakdown:
-                fault_breakdown[f_type]["fn"] += 1
-        else:
-            overall_tn += 1
+    per_class_metrics: Dict[str, dict] = {}
+    print(f"\n{'FAILURE MODE / CLASS':<24} | {'PRECISION':<10} | {'RECALL':<8} | {'F1-SCORE':<9} | {'SUPPORT':<8}")
+    print("-" * 72)
 
-    precision = overall_tp / (overall_tp + overall_fp) if (overall_tp + overall_fp) > 0 else 0.0
-    recall = overall_tp / (overall_tp + overall_fn) if (overall_tp + overall_fn) > 0 else 0.0
-    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-    accuracy = (overall_tp + overall_tn) / len(test_stream) if test_stream else 0.0
+    for i, c_name in enumerate(classes):
+        tp = cm[i][i]
+        fp = sum(cm[j][i] for j in range(len(classes)) if j != i)
+        fn = sum(cm[i][j] for j in range(len(classes)) if j != i)
+        support = sum(cm[i][j] for j in range(len(classes)))
+
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) > 0 else 0.0
+
+        per_class_metrics[c_name] = {
+            "tp": tp, "fp": fp, "fn": fn,
+            "precision": prec, "recall": rec, "f1": f1,
+            "support": support,
+        }
+
+        grade = "🟢" if f1 >= 0.80 else "🟡" if f1 >= 0.50 else "⚪"
+        print(f"{grade} {c_name:<22} | {prec:<10.2f} | {rec:<8.2f} | {f1:<9.2f} | {support:<8}")
+
+    print("-" * 72)
+
+    # Macro & Anomaly-only averages
+    fault_f1s = [per_class_metrics[f]["f1"] for f in fault_types]
+    macro_fault_f1 = sum(fault_f1s) / len(fault_f1s)
+    macro_fault_prec = sum(per_class_metrics[f]["precision"] for f in fault_types) / len(fault_types)
+    macro_fault_rec = sum(per_class_metrics[f]["recall"] for f in fault_types) / len(fault_types)
+
+    print(f"  {'ANOMALY FAULT MACRO':<22} | {macro_fault_prec:<10.2f} | {macro_fault_rec:<8.2f} | {macro_fault_f1:<9.2f} | {anomaly_count}")
 
     avg_lat = sum(latencies) / len(latencies) if latencies else 0.0
     lat_sorted = sorted(latencies)
     p95_lat = lat_sorted[int(len(lat_sorted) * 0.95)] if lat_sorted else 0.0
     p99_lat = lat_sorted[int(len(lat_sorted) * 0.99)] if lat_sorted else 0.0
 
-    # Print Class Breakdown
-    print(f"\n{'FAILURE MODE / FAULT TYPE':<28} | {'PRECISION':<10} | {'RECALL':<8} | {'F1-SCORE':<9} | {'SUPPORT':<8}")
-    print("-" * 75)
-    for f_name, counts in fault_breakdown.items():
-        tp, fn = counts["tp"], counts["fn"]
-        supp = tp + fn
-        r = tp / supp if supp > 0 else 0.0
-        # Precision in multi-fault assignment
-        p = tp / (tp + overall_fp / len(fault_types)) if (tp + overall_fp / len(fault_types)) > 0 else 0.0
-        f_score = (2 * p * r) / (p + r) if (p + r) > 0 else 0.0
-        grade = "🟢" if f_score >= 0.80 else "🟡" if f_score >= 0.50 else "⚪"
-        print(f"{grade} {f_name:<26} | {p:<10.2f} | {r:<8.2f} | {f_score:<9.2f} | {supp:<8}")
-    print("-" * 75)
-    print(f"  {'OVERALL ENSEMBLE':<26} | {precision:<10.2f} | {recall:<8.2f} | {f1:<9.2f} | {anomaly_count}")
-
-    print("\n" + "=" * 80)
-    print("  OPERATIONAL & SPEED PERFORMANCE METRICS")
-    print("=" * 80)
-    print(f"  • Total Stream Events Evaluated : {len(test_stream)}")
-    print(f"  • Overall Classification Accuracy: {accuracy * 100:.1f}% ({overall_tp + overall_tn}/{len(test_stream)})")
-    print(f"  • Overall Precision / Recall / F1: {precision:.2f} / {recall:.2f} / {f1:.2f}")
-    print(f"  • Ingestion Throughput Capacity : {throughput:,.1f} events/sec")
-    print(f"  • Average Processing Latency     : {avg_lat:.3f} ms")
-    print(f"  • 95th Percentile (p95) Latency  : {p95_lat:.3f} ms")
-    print(f"  • 99th Percentile (p99) Latency  : {p99_lat:.3f} ms")
-    print(f"  • Buffer Backpressure Drop Rate  : 0.0% (0/{len(test_stream)})")
-    print("=" * 80 + "\n")
+    print(f"\n  • Multi-Class Overall Accuracy : {overall_accuracy * 100:.1f}% ({total_correct}/{len(test_stream)})")
+    print(f"  • Detector Ensemble Throughput  : {throughput:,.1f} events/sec")
+    print(f"  • Average Latency per Record    : {avg_lat:.3f} ms (p95: {p95_lat:.3f} ms, p99: {p99_lat:.3f} ms)")
 
     return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "accuracy": accuracy,
+        "overall_accuracy": overall_accuracy,
+        "macro_fault_precision": macro_fault_prec,
+        "macro_fault_recall": macro_fault_rec,
+        "macro_fault_f1": macro_fault_f1,
+        "per_class": per_class_metrics,
         "throughput_eps": throughput,
-        "avg_latency_ms": avg_lat,
-        "p95_latency_ms": p95_lat,
+        "avg_lat_ms": avg_lat,
+        "p95_lat_ms": p95_lat,
     }
+
+
+def benchmark_streaming_engine_and_backpressure():
+    print("\n" + "=" * 80)
+    print("  SECTION 2: DISTRIBUTED STREAMING ENGINE, BACKPRESSURE & RECOVERY")
+    print("=" * 80)
+
+    # Part A: Consumer Group Queue Throughput & ACK Pipeline
+    processor = StreamProcessor()
+    sim = IndustrialTelemetrySimulator(seed=999)
+    n_stream_events = 1000
+
+    t_ingest_start = time.perf_counter()
+    for i in range(n_stream_events):
+        rec = sim.generate_reading("motor_unit_01")
+        processor.stream.add(rec)
+    t_ingest = time.perf_counter() - t_ingest_start
+    ingest_throughput = n_stream_events / t_ingest if t_ingest > 0 else 0.0
+
+    t_consume_start = time.perf_counter()
+    batches = 0
+    while True:
+        _ = processor.process_pending_stream(count=100)
+        batches += 1
+        metrics = processor.stream.get_metrics()
+        if metrics.backlog_count == 0:
+            break
+        if batches > 200:  # safety break
+            break
+    t_consume = time.perf_counter() - t_consume_start
+    consumer_throughput = n_stream_events / t_consume if t_consume > 0 else 0.0
+
+    print(f"  ✓ Stream Buffer Ingestion Rate  : {ingest_throughput:,.1f} events/sec")
+    print(f"  ✓ Consumer Group Processing Rate: {consumer_throughput:,.1f} events/sec (with XREADGROUP + XACK)")
+
+    # Part B: Empirical Backpressure Capacity Drop Verification
+    bounded_engine = MemoryStreamEngine(max_len=200, drop_policy="drop_oldest")
+    flood_count = 600
+    for _ in range(flood_count):
+        rec = sim.generate_reading("pump_flood_test")
+        bounded_engine.add(rec)
+
+    bp_metrics = bounded_engine.get_metrics()
+    expected_drops = flood_count - 200
+    actual_drops = bp_metrics.dropped_count
+    drop_rate_pct = (actual_drops / flood_count) * 100.0
+
+    print(f"  ✓ Bounded Queue Stress Test     : {flood_count} events pumped into capacity 200 buffer")
+    print(f"  ✓ Measured Dropped Events       : {actual_drops} (Expected: {expected_drops}, Rate: {drop_rate_pct:.1f}%)")
+    print(f"  ✓ Active Buffer Backlog Depth   : {bp_metrics.backlog_count} / {bp_metrics.max_len}")
+    assert actual_drops == expected_drops, f"Expected {expected_drops} drops, got {actual_drops}"
+
+    # Part C: Worker Crash & PEL Recovery (XCLAIM)
+    crashed_group = "critical-alerts"
+    bounded_engine.create_consumer_group(crashed_group)
+    for _ in range(50):
+        bounded_engine.add(sim.generate_reading("cnc_crash_test"))
+
+    # Worker 1 reads 50 entries and simulatedly crashes without ACK
+    unacked_entries = bounded_engine.read_group(crashed_group, "crashed_worker_01", count=50)
+    pending_before = bounded_engine.get_pending_count(crashed_group)
+    print(f"  ✓ Worker Crash Simulation      : 'crashed_worker_01' pulled {len(unacked_entries)} records and died without ACK")
+    print(f"  ✓ Pending Entries List (PEL)    : {pending_before} unacknowledged entries held in PEL")
+
+    # Worker 2 reclaims all stale entries with min_idle_ms=0
+    reclaimed = bounded_engine.claim_stale(crashed_group, "standby_worker_02", min_idle_ms=0, count=50)
+    print(f"  ✓ PEL Stale Message Reclaim     : 'standby_worker_02' reclaimed {len(reclaimed)}/50 entries via XCLAIM")
+
+    # Worker 2 acknowledges all reclaimed entries
+    for msg_id, _ in reclaimed:
+        bounded_engine.ack(crashed_group, msg_id)
+
+    pending_after = bounded_engine.get_pending_count(crashed_group)
+    print(f"  ✓ Post-Recovery PEL Depth       : {pending_after} (100% Recovery & Acknowledgment Success)")
+    assert pending_after == 0, "PEL was not completely cleared!"
+
+    print("=" * 80 + "\n")
+    return {
+        "ingest_throughput_eps": ingest_throughput,
+        "consumer_throughput_eps": consumer_throughput,
+        "measured_drops": actual_drops,
+        "drop_rate_pct": drop_rate_pct,
+        "pel_recovery_rate_pct": 100.0,
+    }
+
+
+def run_benchmark():
+    sec1 = benchmark_anomaly_classification()
+    sec2 = benchmark_streaming_engine_and_backpressure()
+    return {"classification": sec1, "streaming": sec2}
 
 
 if __name__ == "__main__":

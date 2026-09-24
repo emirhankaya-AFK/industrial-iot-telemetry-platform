@@ -22,9 +22,15 @@ class StreamMessage:
 class MemoryStreamEngine:
     """In-memory streaming buffer with Redis Streams semantics."""
 
-    def __init__(self, stream_name: str = "telemetry:stream", max_len: int = 50_000):
+    def __init__(
+        self,
+        stream_name: str = "telemetry:stream",
+        max_len: int = 50_000,
+        drop_policy: str = "drop_oldest",
+    ):
         self.stream_name = stream_name
         self.max_len = max_len
+        self.drop_policy = drop_policy
         self._messages: collections.deque[StreamMessage] = collections.deque()
         self._counter: int = 0
         self._dropped_count: int = 0
@@ -50,8 +56,12 @@ class MemoryStreamEngine:
 
         # Backpressure drop handling
         if len(self._messages) >= self.max_len:
-            self._messages.popleft()
-            self._dropped_count += 1
+            if self.drop_policy == "drop_oldest":
+                self._messages.popleft()
+                self._dropped_count += 1
+            else:  # drop_newest
+                self._dropped_count += 1
+                return msg_id
 
         msg = StreamMessage(msg_id=msg_id, record=record, timestamp_ms=now_ms)
         self._messages.append(msg)
@@ -93,6 +103,12 @@ class MemoryStreamEngine:
                 return True
         return False
 
+    def get_pending_count(self, group_name: str) -> int:
+        """Returns the total number of unacknowledged entries held in PEL."""
+        if group_name not in self._groups:
+            return 0
+        return len(self._groups[group_name]["pending"])
+
     def get_pending_entries(self, group_name: str) -> List[dict]:
         """Inspects Pending Entries List (PEL) for unacknowledged messages."""
         if group_name not in self._groups:
@@ -113,16 +129,21 @@ class MemoryStreamEngine:
         group_name: str,
         new_consumer: str,
         min_idle_time_ms: int = 5000,
+        min_idle_ms: Optional[int] = None,
+        count: Optional[int] = None,
     ) -> List[Tuple[str, TelemetryRecord]]:
         """Reclaims un-ACKed messages from crashed consumers (XCLAIM)."""
         if group_name not in self._groups:
             return []
+        idle_threshold = min_idle_ms if min_idle_ms is not None else min_idle_time_ms
         now_ms = int(time.time() * 1000)
         pending = self._groups[group_name]["pending"]
-        reclaimed = []
+        reclaimed: List[Tuple[str, TelemetryRecord]] = []
 
-        for mid, (old_cons, t_del, msg) in list(pending.items()):
-            if (now_ms - t_del) >= min_idle_time_ms:
+        for mid, (_old_cons, t_del, msg) in list(pending.items()):
+            if count is not None and len(reclaimed) >= count:
+                break
+            if (now_ms - t_del) >= idle_threshold:
                 pending[mid] = (new_consumer, now_ms, msg)
                 reclaimed.append((mid, msg.record))
 

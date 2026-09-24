@@ -11,11 +11,13 @@ from src.alerting.deduplicator import AlertDeduplicator
 from src.alerting.dispatcher import AlertDispatcher
 from src.detector.correlation_detector import MultiSensorCorrelationDetector
 from src.detector.ewma_detector import EWMADetector
+from src.detector.isolation_forest import IsolationForestBenchmarkDetector
 from src.detector.zscore_detector import RobustZScoreDetector
 from src.ingestion.authenticator import DeviceAuthenticator
 from src.models.schemas import (
     AlertEvent,
     AnomalyRecord,
+    AnomalyType,
     PipelineMetrics,
     TelemetryRecord,
 )
@@ -33,6 +35,8 @@ class StreamProcessor:
         dispatcher: Optional[AlertDispatcher] = None,
         consumer_group: str = "anomaly-detectors",
         consumer_id: str = "worker_node_01",
+        isolation_forest: Optional[IsolationForestBenchmarkDetector] = None,
+        enable_isolation_forest: bool = False,
     ):
         self.stream = stream_engine or RedisStreamEngine()
         self.auth = authenticator or DeviceAuthenticator()
@@ -43,10 +47,14 @@ class StreamProcessor:
         self.consumer_id = consumer_id
         self.stream.create_consumer_group(consumer_group)
 
-        # Detectors
+        # Real-time online streaming detectors (sub-millisecond evaluation)
         self.ewma = EWMADetector()
         self.zscore = RobustZScoreDetector()
         self.correlation = MultiSensorCorrelationDetector()
+
+        # Optional multivariate Isolation Forest baseline model
+        self.isolation_forest = isolation_forest
+        self.enable_isolation_forest = enable_isolation_forest or (isolation_forest is not None)
 
         # Operational metrics tracking
         self.events_ingested: int = 0
@@ -59,6 +67,51 @@ class StreamProcessor:
         # Recent anomaly log per device
         self._recent_anomalies: collections.deque[AnomalyRecord] = collections.deque(maxlen=200)
         self._live_telemetry_cache: Dict[str, collections.deque[TelemetryRecord]] = {}
+
+    def classify_fault(self, anomalies: List[AnomalyRecord]) -> str:
+        """Maps a collection of detector anomalies to a synthesized machinery failure mode."""
+        if not anomalies:
+            return "NOMINAL"
+
+        types = {a.anomaly_type for a in anomalies}
+        metrics = {a.metric_name for a in anomalies}
+
+        has_vib = any(
+            a.anomaly_type in (AnomalyType.VIBRATION_SPIKE, AnomalyType.BEARING_FATIGUE)
+            or "vibration" in a.metric_name
+            for a in anomalies
+        )
+        has_curr = any(
+            a.anomaly_type in (AnomalyType.CURRENT_SURGE, AnomalyType.PHASE_IMBALANCE)
+            or "current" in a.metric_name
+            for a in anomalies
+        )
+        has_temp = any(
+            a.anomaly_type == AnomalyType.THERMAL_DRIFT
+            or "temperature" in a.metric_name
+            for a in anomalies
+        )
+
+        # Multi-sensor electromechanical seizure: simultaneous severe vibration AND current surge
+        if (has_vib and has_curr) or AnomalyType.CORRELATED_SEIZURE in types or "composite_fault_index" in metrics:
+            if has_vib and has_curr:
+                return "CORRELATED_SEIZURE"
+            if AnomalyType.CORRELATED_SEIZURE in types:
+                return "CORRELATED_SEIZURE"
+
+        # Bearing fatigue characterized by high kurtosis & vibration RMS without current surge
+        if AnomalyType.BEARING_FATIGUE in types or "vibration_kurtosis" in metrics or (has_vib and not has_curr):
+            return "BEARING_FATIGUE"
+
+        # Current surge / phase imbalance without severe vibration
+        if AnomalyType.PHASE_IMBALANCE in types or AnomalyType.CURRENT_SURGE in types or "current" in metrics or (has_curr and not has_vib):
+            return "PHASE_IMBALANCE"
+
+        # Thermal runaway / progressive heating without mechanical/electrical surges
+        if AnomalyType.THERMAL_DRIFT in types or "temperature" in metrics or has_temp:
+            return "THERMAL_RUNAWAY"
+
+        return anomalies[0].anomaly_type.value
 
     def ingest_record(self, record: TelemetryRecord) -> str:
         """Authenticates and appends telemetry reading to the stream buffer."""
@@ -80,6 +133,18 @@ class StreamProcessor:
             msg_ids.append(self.ingest_record(r))
         return msg_ids
 
+    def run_detectors(self, record: TelemetryRecord) -> List[AnomalyRecord]:
+        """Runs the streaming detector ensemble on a single record."""
+        anomalies: List[AnomalyRecord] = []
+        anomalies.extend(self.ewma.process(record))
+        anomalies.extend(self.zscore.process(record))
+        anomalies.extend(self.correlation.process(record))
+
+        if self.enable_isolation_forest and self.isolation_forest and self.isolation_forest.is_fitted:
+            anomalies.extend(self.isolation_forest.predict([record]))
+
+        return anomalies
+
     def process_pending_stream(self, count: int = 50) -> List[AlertEvent]:
         """Consumes buffered records from Redis Streams, runs detectors, and dispatches alerts."""
         entries = self.stream.read_group(self.consumer_group, self.consumer_id, count=count)
@@ -89,10 +154,7 @@ class StreamProcessor:
             t0 = time.perf_counter()
 
             # 1. Run multi-detector ensemble
-            anomalies: List[AnomalyRecord] = []
-            anomalies.extend(self.ewma.process(record))
-            anomalies.extend(self.zscore.process(record))
-            anomalies.extend(self.correlation.process(record))
+            anomalies = self.run_detectors(record)
 
             if anomalies:
                 self.anomalies_detected += len(anomalies)
@@ -116,10 +178,7 @@ class StreamProcessor:
     def process_record_sync(self, record: TelemetryRecord) -> List[AnomalyRecord]:
         """Direct synchronous execution for testing and immediate API responses."""
         self.ingest_record(record)
-        anomalies: List[AnomalyRecord] = []
-        anomalies.extend(self.ewma.process(record))
-        anomalies.extend(self.zscore.process(record))
-        anomalies.extend(self.correlation.process(record))
+        anomalies = self.run_detectors(record)
 
         if anomalies:
             self.anomalies_detected += len(anomalies)

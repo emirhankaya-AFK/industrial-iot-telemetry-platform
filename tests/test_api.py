@@ -103,3 +103,50 @@ class TestDevicesAndAlertsEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         assert "dlq_count" in data
+
+
+class TestApiAuthenticationEnforcement:
+    def test_api_auth_enforcement_rejections(self):
+        from api.main import stream_processor
+        original_enforce = stream_processor.auth.enforce_auth
+        original_secret = stream_processor.auth.default_secret
+
+        try:
+            stream_processor.auth.enforce_auth = True
+            stream_processor.auth.default_secret = "api_secret_789"
+            dev_id = "secure_cnc_01"
+            stream_processor.auth.register_device(dev_id, secret_key="api_secret_789")
+
+            # 1. Unregistered device rejected
+            unreg_payload = _make_payload("unregistered_attacker_01")
+            unreg_payload["auth_token"] = "fake"
+            resp1 = client.post("/api/v1/telemetry", json=unreg_payload)
+            assert resp1.status_code == 400
+            assert "unregistered device" in resp1.json()["detail"]
+
+            # 2. Missing token rejected
+            no_token_payload = _make_payload(dev_id)
+            resp2 = client.post("/api/v1/telemetry", json=no_token_payload)
+            assert resp2.status_code == 400
+            assert "missing auth_token" in resp2.json()["detail"]
+
+            # 3. Invalid signature rejected
+            tampered_payload = _make_payload(dev_id)
+            tampered_payload["auth_token"] = "bad_sig_123"
+            resp3 = client.post("/api/v1/telemetry", json=tampered_payload)
+            assert resp3.status_code == 400
+            assert "invalid token signature" in resp3.json()["detail"]
+
+            # 4. Valid signature accepted
+            now_ms = int(time.time() * 1000)
+            valid_payload = _make_payload(dev_id)
+            valid_payload["timestamp_ms"] = now_ms
+            valid_token = stream_processor.auth.generate_token(dev_id, now_ms)
+            valid_payload["auth_token"] = valid_token
+            resp4 = client.post("/api/v1/telemetry", json=valid_payload)
+            assert resp4.status_code == 202
+            assert resp4.json()["status"] == "QUEUED"
+
+        finally:
+            stream_processor.auth.enforce_auth = original_enforce
+            stream_processor.auth.default_secret = original_secret
