@@ -94,14 +94,14 @@ FAILURE MODE / CLASS     | PRECISION  | RECALL   | F1-SCORE  | SUPPORT
   ANOMALY FAULT MACRO    | 0.65       | 0.86     | 0.73      | 200
 
   • Multi-Class Overall Accuracy : 88.6% (1063/1200)
-  • Detector Ensemble Throughput  : 3,602.4 events/sec
-  • Average Latency per Record    : 0.276 ms (p95: 0.831 ms, p99: 2.069 ms)
+  • End-to-End Pipeline Throughput: 2,500.6 events/sec
+  • Average Latency per Record    : 0.389 ms (p95: 0.831 ms, p99: 3.340 ms)
 
 ================================================================================
   SECTION 2: DISTRIBUTED STREAMING ENGINE, BACKPRESSURE & RECOVERY
 ================================================================================
-  ✓ Stream Buffer Ingestion Rate  : 69,829.5 events/sec
-  ✓ Consumer Group Processing Rate: 4,847.7 events/sec (with XREADGROUP + XACK)
+  ✓ Stream Buffer Ingestion Rate  : 60,572.3 events/sec
+  ✓ Consumer Group Processing Rate: 2,910.3 events/sec (with XREADGROUP + XACK)
   ✓ Bounded Queue Stress Test     : 600 events pumped into capacity 200 buffer
   ✓ Measured Dropped Events       : 400 (Expected: 400, Rate: 66.7%)
   ✓ Active Buffer Backlog Depth   : 200 / 200
@@ -122,7 +122,7 @@ FAILURE MODE / CLASS     | PRECISION  | RECALL   | F1-SCORE  | SUPPORT
    - Keys strictly loaded from `IOT_AUTH_SECRET` / `IOT_DEVICE_SECRETS`.
    - Unknown devices transmitting in enforced mode rejected immediately (`HTTP 400`).
 2. **True Consumer-Group & Backpressure Benchmark**:
-   - Measured `XREADGROUP` and `XACK` consumer group processing rate (~4,800 events/sec).
+   - Measured `XREADGROUP` and `XACK` consumer group processing rate (~2,900 events/sec in the documented local sample).
    - Empirically verified buffer capacity drops (400 drops out of 600 flood events, 66.7% drop rate).
    - Empirically verified worker crash simulation and 100% PEL reclaim via `XCLAIM`.
 3. **Isolation Forest Role**:

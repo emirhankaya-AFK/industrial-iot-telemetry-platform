@@ -134,7 +134,7 @@ Used as an offline comparative reference model. In batch calibration mode, norma
 
 ## Quantitative Benchmark Results
 
-The evaluation benchmark (`tests/evaluation/run_benchmark.py`) evaluates the complete system across **1,200 continuous industrial events** (1,000 nominal baseline events and 200 controlled fault events across 4 operational shifts).
+The evaluation benchmark (`tests/evaluation/run_benchmark.py`) evaluates the complete system across **1,200 continuous industrial events** (1,000 nominal baseline events and 200 controlled fault events across 4 operational shifts). Performance figures below are a **2026-09-26 local Windows sample** and are hardware-dependent; classification metrics are deterministic for the fixed seed.
 
 ### Section 1: Multi-Class Confusion Matrix & Classification
 
@@ -162,18 +162,22 @@ CORRELATED_SEIZURE     |          5 |          0 |          0 |          0 |    
 | **ANOMALY FAULT MACRO** | **0.65** | **0.86** | **0.73** | 200 |
 
 - **Multi-Class Overall Accuracy**: **88.6%** (1063 / 1200)
-- **Detector Ensemble Throughput**: **3,600+ events/sec**
-- **Average Processing Latency**: **0.276 ms / event** (p95: 0.831 ms, p99: 2.069 ms)
+- **End-to-End Stream Pipeline Throughput**: **2,500+ events/sec**
+- **Average Processing Latency**: **0.389 ms / event** (p95: 0.831 ms, p99: 3.340 ms)
+
+These classification measurements use an isolated in-memory stream with Redis-compatible
+consumer-group and acknowledgment semantics. Live Redis/MQTT behavior is covered separately
+by the opt-in integration tests; the latency above is processing time, not network latency.
 
 ### Section 2: Distributed Streaming Engine & Backpressure Reliability
 
 Tested directly against the stream engine and consumer groups (`XREADGROUP`, `XACK`, `XCLAIM`):
 
 ```
-  ✓ Stream Buffer Ingestion Rate  : 69,800+ events/sec
-  ✓ Consumer Group Processing Rate: 4,800+ events/sec (with XREADGROUP + XACK)
+  ✓ Stream Buffer Ingestion Rate  : 60,000+ events/sec
+  ✓ Consumer Group Processing Rate: 2,900+ events/sec (with XREADGROUP + XACK)
   ✓ Bounded Queue Stress Test     : 600 events pumped into capacity 200 buffer
-  ✓ Measured Dropped Events       : 400 (Expected: 400, Measured Rate: 66.7%)
+  ✓ Measured Dropped Events       : 400 (Expected: 400, Rate: 66.7%)
   ✓ Active Buffer Backlog Depth   : 200 / 200
   ✓ Worker Crash Simulation      : 'crashed_worker_01' pulled 50 records and died without ACK
   ✓ Pending Entries List (PEL)    : 50 unacknowledged entries held in PEL
@@ -227,7 +231,7 @@ The Streamlit-based operations terminal (`dashboard/app.py`) provides:
    # Linting with Ruff (0 errors)
    ruff check .
 
-   # Unit and integration test suite (35 tests)
+   # Unit and integration test suite (36 pass; 2 live-service tests opt-in)
    pytest tests/ -v
 
    # Run quantitative benchmark

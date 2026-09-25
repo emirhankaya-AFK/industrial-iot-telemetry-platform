@@ -9,6 +9,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.models.schemas import SensorType, TelemetryRecord
+from src.pipeline.stream_processor import StreamProcessor
 from src.streaming.memory_stream import MemoryStreamEngine
 from src.streaming.redis_stream import RedisStreamEngine
 
@@ -99,3 +100,27 @@ class TestRedisStreamEngineFallback:
         entries = engine.read_group("grp1", "worker_01", count=1)
         assert len(entries) == 1
         assert engine.ack("grp1", entries[0][0]) is True
+
+
+def test_stream_processor_callback_failure_does_not_strand_batch():
+    engine = MemoryStreamEngine(stream_name="callback_test", max_len=10)
+    observed = []
+
+    def observe(record, anomalies, latency_ms):
+        observed.append((record, anomalies, latency_ms))
+        if len(observed) == 1:
+            raise RuntimeError("simulated observer failure")
+
+    processor = StreamProcessor(
+        stream_engine=engine,
+        on_record_processed=observe,
+    )
+
+    records = [_make_dummy_record(1), _make_dummy_record(2)]
+    processor.ingest_batch(records)
+    processor.process_pending_stream(count=2)
+
+    assert [item[0] for item in observed] == records
+    assert all(item[2] >= 0 for item in observed)
+    assert processor.events_processed == 2
+    assert engine.get_pending_count("anomaly-detectors") == 0

@@ -25,12 +25,19 @@ def benchmark_anomaly_classification():
     print("=" * 80)
 
     sim = IndustrialTelemetrySimulator(seed=1337)
-    processor = StreamProcessor()
-
     devices = ["motor_unit_01", "cnc_spindle_02", "cooling_pump_03"]
     nominal_count = 1000
     anomaly_count = 200
     total_events = nominal_count + anomaly_count
+
+    # Keep the classification run reproducible and isolated from any persistent
+    # Redis stream left behind by a previous local benchmark.
+    processor = StreamProcessor(
+        stream_engine=MemoryStreamEngine(
+            stream_name="benchmark:classification",
+            max_len=total_events,
+        )
+    )
 
     # Ground truth tracking: [(record, ground_truth_class)]
     test_stream: List[tuple[TelemetryRecord, str]] = []
@@ -66,28 +73,55 @@ def benchmark_anomaly_classification():
     for d in devices:
         sim.clear_fault(d)
 
-    # 3. Synchronous inference & latency timing
+    # 3. Queued consumer-group inference through the stream processing path
     classes = ["NOMINAL", "BEARING_FATIGUE", "THERMAL_RUNAWAY", "PHASE_IMBALANCE", "CORRELATED_SEIZURE"]
     class_to_idx = {c: i for i, c in enumerate(classes)}
     cm = [[0 for _ in classes] for _ in classes]
 
     latencies: List[float] = []
+
+    # Ground truth map for all ingested records
+    gt_map = {f"{r.device_id}_{r.timestamp_ms}": gt for r, gt in test_stream}
+    predictions = {}
+
+    def _on_processed(rec, anomalies, latency_ms):
+        pred_class = processor.classify_fault(anomalies)
+        key = f"{rec.device_id}_{rec.timestamp_ms}"
+        predictions[key] = pred_class
+        latencies.append(latency_ms)
+
+    processor.on_record_processed = _on_processed
+
     t_start = time.perf_counter()
 
-    for rec, gt_class in test_stream:
-        t0 = time.perf_counter()
-        anomalies = processor.run_detectors(rec)
-        pred_class = processor.classify_fault(anomalies)
-        lat = (time.perf_counter() - t0) * 1000.0
-        latencies.append(lat)
+    # Phase 1: Ingest all records into the deterministic stream buffer.
+    for rec, _gt_class in test_stream:
+        processor.ingest_record(rec)
 
-        gt_idx = class_to_idx[gt_class]
-        pred_idx = class_to_idx.get(pred_class, 0)
-        cm[gt_idx][pred_idx] += 1
+    # Phase 2: Consume all records from the Stream Engine (Consumer Group)
+    while True:
+        processed_before = processor.events_processed
+        processor.process_pending_stream(count=200)
+        if processor.events_processed == processed_before:
+            # No new events were processed, stream is fully consumed
+            break
 
     t_total = time.perf_counter() - t_start
     throughput = len(test_stream) / t_total if t_total > 0 else 0.0
 
+    if len(predictions) != len(test_stream):
+        missing = len(test_stream) - len(predictions)
+        raise AssertionError(
+            f"Classification benchmark lost {missing} records in the stream path"
+        )
+
+    # Build confusion matrix from processed records
+    for key, gt_class in gt_map.items():
+        pred_class = predictions[key]
+
+        gt_idx = class_to_idx[gt_class]
+        pred_idx = class_to_idx.get(pred_class, 0)
+        cm[gt_idx][pred_idx] += 1
     # 4. Print Multi-Class Confusion Matrix
     header_title = r"Actual \ Predicted"
     print("\nCONFUSION MATRIX (Ground Truth rows vs Predicted columns):")
@@ -141,7 +175,7 @@ def benchmark_anomaly_classification():
     p99_lat = lat_sorted[int(len(lat_sorted) * 0.99)] if lat_sorted else 0.0
 
     print(f"\n  • Multi-Class Overall Accuracy : {overall_accuracy * 100:.1f}% ({total_correct}/{len(test_stream)})")
-    print(f"  • Detector Ensemble Throughput  : {throughput:,.1f} events/sec")
+    print(f"  • End-to-End Pipeline Throughput: {throughput:,.1f} events/sec")
     print(f"  • Average Latency per Record    : {avg_lat:.3f} ms (p95: {p95_lat:.3f} ms, p99: {p99_lat:.3f} ms)")
 
     return {

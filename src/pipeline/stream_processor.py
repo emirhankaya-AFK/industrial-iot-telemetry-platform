@@ -4,8 +4,9 @@ Orchestrates Authentication -> Stream Buffering -> Multi-Detector Anomaly Engine
 from __future__ import annotations
 
 import collections
+import logging
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from src.alerting.deduplicator import AlertDeduplicator
 from src.alerting.dispatcher import AlertDispatcher
@@ -23,6 +24,8 @@ from src.models.schemas import (
 )
 from src.streaming.redis_stream import RedisStreamEngine
 
+logger = logging.getLogger(__name__)
+
 
 class StreamProcessor:
     """Central industrial IoT processing engine."""
@@ -37,11 +40,15 @@ class StreamProcessor:
         consumer_id: str = "worker_node_01",
         isolation_forest: Optional[IsolationForestBenchmarkDetector] = None,
         enable_isolation_forest: bool = False,
+        on_record_processed: Optional[
+            Callable[[TelemetryRecord, List[AnomalyRecord], float], None]
+        ] = None,
     ):
         self.stream = stream_engine or RedisStreamEngine()
         self.auth = authenticator or DeviceAuthenticator()
         self.dedup = deduplicator or AlertDeduplicator(cooldown_seconds=60)
         self.dispatcher = dispatcher or AlertDispatcher()
+        self.on_record_processed = on_record_processed
 
         self.consumer_group = consumer_group
         self.consumer_id = consumer_id
@@ -172,6 +179,14 @@ class StreamProcessor:
 
             latency_ms = (time.perf_counter() - t0) * 1000.0
             self._latencies.append(latency_ms)
+
+            # Optional observability hook used by benchmarks and integrations.
+            # It runs only after the message has been acknowledged and metrics updated.
+            if self.on_record_processed:
+                try:
+                    self.on_record_processed(record, anomalies, latency_ms)
+                except Exception:
+                    logger.exception("on_record_processed callback failed")
 
         return alerts_emitted
 
